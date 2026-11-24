@@ -286,7 +286,9 @@ final class QuicheQuicStreamChannel extends DefaultAttributeMap implements QuicS
     }
 
     private boolean isInputTerminated() {
-        return finReceived || inputReset;
+        // Set once a FIN or reset was read, and also when the input was shut down locally: quiche drops what the peer
+        // sends from then on.
+        return inputShutdown;
     }
 
     void stopSendingErrorCode(long errorCode) {
@@ -297,12 +299,20 @@ final class QuicheQuicStreamChannel extends DefaultAttributeMap implements QuicS
         if (!outputStopped) {
             outputStopped = true;
             outputShutdown = true;
-            pipeline.fireUserEventTriggered(new QuicStreamStoppedEvent(stopSendingErrorCode));
+            // Nothing can be written any more.
+            capacity = 0;
+            updateWritabilityIfNeeded(false);
+            // A stream that is not registered yet gets the event once it is, see register().
+            if (registered) {
+                pipeline.fireUserEventTriggered(new QuicStreamStoppedEvent(stopSendingErrorCode));
+                eventLoop().execute(QuicheQuicStreamChannel.this::closeIfDone);
+            }
         }
     }
 
     private void closeIfDone() {
-        if (finSent && (isInputTerminated() || type() == QuicStreamType.UNIDIRECTIONAL && isLocalCreated())) {
+        if (active && (finSent || outputStopped) &&
+                (isInputTerminated() || type() == QuicStreamType.UNIDIRECTIONAL && isLocalCreated())) {
             unsafe().close(unsafe().voidPromise());
         }
     }
@@ -458,6 +468,9 @@ final class QuicheQuicStreamChannel extends DefaultAttributeMap implements QuicS
             }
             return false;
         }
+        if (outputStopped) {
+            return false;
+        }
         this.capacity = capacity;
         boolean mayNeedWrite = unsafe().writeQueued();
         // we need to re-read this.capacity as writeQueued() may update the capacity.
@@ -535,6 +548,10 @@ final class QuicheQuicStreamChannel extends DefaultAttributeMap implements QuicS
             promise.setSuccess();
             pipeline.fireChannelRegistered();
             pipeline.fireChannelActive();
+            if (outputStopped) {
+                pipeline.fireUserEventTriggered(new QuicStreamStoppedEvent(stopSendingErrorCode));
+                closeIfDone();
+            }
         }
 
         @Override
@@ -702,14 +719,9 @@ final class QuicheQuicStreamChannel extends DefaultAttributeMap implements QuicS
         }
 
         private void closeIfNeeded(boolean wasFinSent) {
-            // Let's check if we should close the channel now.
-            // If it's a unidirectional channel we can close it as there will be no fin that we can read
-            // from the remote peer. If its an bidirectional channel we should only close the channel if we
-            // also received the fin from the remote peer.
-            if (!wasFinSent && QuicheQuicStreamChannel.this.finSent
-                    && (type() == QuicStreamType.UNIDIRECTIONAL || isInputTerminated())) {
-                // close the channel now
-                close(voidPromise());
+            // The FIN was just sent: close the channel if the input is done as well.
+            if (!wasFinSent && QuicheQuicStreamChannel.this.finSent) {
+                closeIfDone();
             }
         }
 
@@ -772,6 +784,8 @@ final class QuicheQuicStreamChannel extends DefaultAttributeMap implements QuicS
                 queueAndFailAll(msg, promise, new ClosedChannelException());
             } else if (finSent) {
                 queueAndFailAll(msg, promise, new ChannelOutputShutdownException("Fin was sent already"));
+            } else if (outputStopped) {
+                queueAndFailAll(msg, promise, new ChannelOutputShutdownException("STOP_SENDING frame received"));
             } else if (!queue.isEmpty()) {
                 // If the queue is not empty we should just add the message to the queue as we will drain
                 // it later once the stream becomes writable again.
